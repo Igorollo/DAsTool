@@ -1,0 +1,13 @@
+Top 10 highest MAPE values:
+ 1. Part:0281239 Sales Org:FR05 → 893.09%
+ 2. Part:8014654 Sales Org:BE02 → 512.86%
+ 3. Part:3020492 Sales Org:BE02 → 367.01%
+ 4. Part:3086076 Sales Org:FR05 → 324.74%
+ 5. Part:3086077 Sales Org:FR05 → 312.88%
+ 6. Part:3064625 Sales Org:NL03 → 265.98%
+ 7. Part:0278775 Sales Org:FR05 → 232.77%
+ 8. Part:3020491 Sales Org:BE02 → 220.03%
+ 9. Part:3103736 Sales Org:NL03 → 209.63%
+10. Part:0281241 Sales Org:FR05 → 163.85%
+Lowest  MAPE: Part:8062264 Sales Org:BE02 → 45.56%
+Mean    MAPE: 213.03%
