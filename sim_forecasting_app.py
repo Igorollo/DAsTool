@@ -37,7 +37,9 @@ if 'best_forecasts' not in st.session_state:
     st.session_state.best_forecasts = None
 if 'selected_item' not in st.session_state:
     st.session_state.selected_item = None
-
+if 'selected_result_item' not in st.session_state:
+    # remembers the choice in the Results filter
+    st.session_state.selected_result_item = 'All Items'
 # --- Helper Functions ---
 def display_error(message):
     """Displays an error message in the Streamlit app."""
@@ -120,7 +122,7 @@ def run_analysis(uploaded_file, sheet_name, skiprows, date_col, value_col, item_
         with st.spinner('Analyzing data and finding best models... Please wait.'):
             # Ensure item_col is None if the checkbox isn't selected or field is empty
             effective_item_col = item_col if item_col else None
-
+            print(f"Effective item column: {effective_item_col}")
             # Call the simplified logic function with forecast data for visualization
             results, best_forecasts = sim_logic.run_simplified_forecast(
                 file_path=uploaded_file, # Pass the uploaded file object directly
@@ -251,7 +253,31 @@ if st.session_state.error_message:
 
 if st.session_state.results_df is not None and not st.session_state.results_df.empty:
     results = st.session_state.results_df
-    st.dataframe(results)
+
+    # ────────────────────────────────────────────────
+    # NEW ▸ let the user filter the summary table
+    # ────────────────────────────────────────────────
+    if 'Forecast Item' in results.columns and results['Forecast Item'].nunique() > 1:
+        items = sorted(results['Forecast Item'].unique())
+        item_options = ['All Items'] + items
+
+        selected_result_item = st.selectbox(
+            "Filter by Forecast Item",
+            item_options,
+            index=item_options.index(st.session_state.selected_result_item)
+            if st.session_state.selected_result_item in item_options else 0
+        )
+        st.session_state.selected_result_item = selected_result_item
+
+        if selected_result_item != 'All Items':
+            results_to_show = results[results['Forecast Item'] == selected_result_item]
+        else:
+            results_to_show = results
+    else:
+        # Single item → no selector needed
+        results_to_show = results
+
+    st.dataframe(results_to_show)
     
     # Visualization section
     if st.session_state.best_forecasts and len(st.session_state.best_forecasts) > 0:
@@ -270,12 +296,9 @@ if st.session_state.results_df is not None and not st.session_state.results_df.e
         # Plot the selected item's forecast
         if selected_item in st.session_state.best_forecasts:
             forecast_data = st.session_state.best_forecasts[selected_item]
-            st.write("Available forecast data keys:", list(forecast_data.keys()))
             fig = plot_forecast(selected_item, forecast_data)
             if fig:
                 st.pyplot(fig)
-
-    st.markdown("--- Télécharger ---")
 
     # Provide download link for the results
     # Need to re-run the logic to get the buffer if not stored, or store the buffer
@@ -287,7 +310,7 @@ if st.session_state.results_df is not None and not st.session_state.results_df.e
             df.to_excel(writer, index=False, sheet_name='Best_Models')
         return output.getvalue()
 
-    excel_bytes = get_excel_download(results)
+    excel_bytes = get_excel_download(results_to_show)
 
     st.download_button(
         label="📥 Download Results as Excel",

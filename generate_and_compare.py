@@ -15,11 +15,11 @@ from sim_forecasting_logic import (
 )
 
 # --- Configuration ---
-HISTORICAL_DATA_FILE = "Outliers-2.xlsx"
-CONFIG_FILE = "Arima/Forecast Item Configuration ARIMA.xlsx" #"/Users/igor/DemandForecasting/Forecast Item Configuration Exp.xlsx"#
-CONFIG_FILE_OVERRIDE = "Arima/Forecast Item Configuration ARIMA.xlsx"
-CONSENSUS_FILE = "Arima/Consensus Demand Plan - Next Level Summary ARIMA.xlsx"
-OUTPUT_FILE = "forecast_comparison ARIMA.xlsx"
+HISTORICAL_DATA_FILE = "Arima/Outliers 111 ARIMA.xlsx"
+CONFIG_FILE = "MLR/Forecast Item Configuration MLR Mine.xlsx" #"/Users/igor/DemandForecasting/Forecast Item Configuration Exp.xlsx"#
+CONFIG_FILE_OVERRIDE = "MLR/Forecast Item Configuration MLR Mine.xlsx"
+CONSENSUS_FILE = "MLR/Consensus Demand Plan MLR Mine.xlsx"
+OUTPUT_FILE = "forecast_comparison MLR MINE.xlsx"
 
 # ### ADJUST_CONFIG ### - Define column names for the Configuration file
 CONFIG_SHEET_NAME = 0 # Or the specific sheet name as string
@@ -104,13 +104,13 @@ def main():
             return group.iloc[3:-2]
 
         # 3. Apply per‐group
-        trimmed = (
+        """trimmed = (
             historical_data
             .groupby('Forecast Item', group_keys=False)
             .apply(drop_edges)
             .reset_index(drop=True)
         )
-        historical_data = trimmed
+        historical_data = trimmed"""
         logging.info("Missing weeks filled.")
         # --- End manual fill step ---
         # Load configuration data
@@ -222,7 +222,7 @@ def main():
             )
         target_date = pd.to_datetime("2020-11-02")
         # 1. Build a mask of rows where Stop.1 is not missing
-        mask = df_config["Stop.1"].notna() | (df_config["Start Date"] != target_date) | (df_config["Change"] != 0.0) | df_config["Other Items"].notna() | (df_config['Forecast.1'] != 106) #| (df_config["Factor"] != 1)
+        mask = df_config["Stop.1"].notna() | (df_config["Change"] != 0.0) | df_config["Other Items"].notna() | (df_config['Forecast.1'] != 106) #| (df_config["Factor"] != 1)
 
         # 2. Use .loc to select only the Forecast Item column for those rows
         forecast_items_with_dates = df_config.loc[mask, "Forecast Item"]
@@ -250,7 +250,7 @@ def main():
                 )
             )
             # Quick sanity‐check:
-        df_long['Date'] = pd.to_datetime(df_long['date'], format='%d-%b-%y')
+        df_long['Date'] = pd.to_datetime(df_long['date'], format='%m-%d-%y')
         tidy = (
             df_long
             .pivot_table(
@@ -350,6 +350,7 @@ def main():
                 if param_name not in item_config.index: # Check if param_name is in the columns of item_config
                     raise KeyError(f"Parameter '{param_name}' not found in config for item {item}")
                 seasonality = int(item_config[param_name])
+                print(item_hist_data)
                 generated_forecast = forecast_multiple_linear_regression(item_hist_data, item_forecast_horizon, seasonality)
                 params_used = {param_name: seasonality}
             elif model_name == 'ARIMA': # ### ADJUST_MODEL_NAME ###
@@ -357,7 +358,6 @@ def main():
                 param_ma_name = 'Moving Average' # ### ADJUST_PARAM_NAME ###
                 param_d_name = 'Level' # ### ADJUST_PARAM_NAME ###
                 param_constant_name = "Constant" # ### ADJUST_PARAM_NAME ###
-                print(item_config[[param_ar_name, param_ma_name, param_d_name, param_constant_name]])
                 if param_ar_name not in item_config.index: # Check if param_name is in the columns of item_config
                     raise KeyError(f"Parameter '{param_ar_name}' not found in config for item {item}")
                 if param_ma_name not in item_config.index: # Check if param_name is in the columns of item_config
@@ -389,11 +389,12 @@ def main():
                     raise ValueError(f"Invalid constant value for {item}: {constant_str}")
                 try:
                     # Convert string '(p,d,q)' to tuple
-                    order_tuple = tuple(map(int, (ar_int, d_int, ma_int)))
+                    order_tuple = (ar_int, 1, ma_int)
                 except:
                     logging.warning(f"Invalid ARIMA order format for {item}: {order_str}. Using default (1,1,1).")
                     order_tuple = (1,1,1)
-                generated_forecast = forecast_arima(item_hist_data, item_forecast_horizon, order_tuple, constant_str)
+                print(order_tuple)
+                generated_forecast = forecast_arima(item_hist_data, item_forecast_horizon, order_tuple, "n")
                 params_used = {param_ar_name: ar_int, param_ma_name: ma_int, param_d_name: d_int, param_constant_name: constant_str}
 
             # Add other models (Croston, etc.) here if needed, checking model/param names
@@ -426,7 +427,18 @@ def main():
                     'Generated Forecast': generated_forecast,
                     'Consensus Forecast': actuals_for_mape # Use aligned actuals
                 })
-
+                print("DATAA")
+                print(item_hist_data_df['Date'].iloc[-1])
+                x_axis = pd.to_datetime([item_hist_data_df['Date'].iloc[-1] + pd.Timedelta(weeks=i) for i in range(len(item_comparison.index))])
+                import matplotlib.pyplot as plt
+                plt.plot(x_axis, item_comparison['Consensus Forecast'].values, label='Consensus Forecast')
+                plt.plot(x_axis, item_comparison['Generated Forecast'].values, label='Generated Forecast')
+                plt.plot(item_hist_data_df['Date'], item_hist_data_df['Value'], label='Historical Data')
+                plt.ylabel('Demand')
+                plt.xlabel('Date')
+                plt.title(f'Forecast Comparison for {item}')
+                plt.legend()
+                plt.show()
                 # Calculate MAPE
                 mape = np.nan # Default in case of issues
                 if not actuals_for_mape.empty and not generated_forecast.empty:
@@ -489,7 +501,7 @@ def main():
     min_mape = comparison_mape[min_item]
 
     # 3. Compute the mean MAPE
-    mean_mape = statistics.mean(comparison_mape.values())
+    mean_mape = statistics.mean(sorted(list(comparison_mape.values())))
 
     # 4. Print results
     # 1. Sort items by MAPE descending and take the first 10
@@ -497,7 +509,7 @@ def main():
         comparison_mape.items(),
         key=lambda kv: kv[1],
         reverse=True
-    )[:10]
+    )[0:10]
 
     # 2. Print them out
     print("Top 10 highest MAPE values:")

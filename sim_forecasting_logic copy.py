@@ -66,68 +66,26 @@ def remove_leading_zeros(series: pd.Series) -> pd.Series:
     # Return series from the first non-zero value onwards
     return series.loc[first_nonzero_idx:]    
 
-def fill_missing_weeks(
-    df: pd.DataFrame,
-    date_col: str = "Date",
-    item_col: Optional[str] = "Forecast Item"
-) -> pd.DataFrame:
+def fill_missing_weeks(df: pd.DataFrame, date_col: str = 'Date') -> pd.DataFrame:
     """
-    Pad every Forecast Item with the full weekly range between the
-    global min-date and max-date.  Missing weeks are inserted with Value=0.
-
-    Works whether the frame already has a DatetimeIndex *or* still has a
-    plain `date_col` column.
+    Ensures there are no missing weekly records between the first and last date.
+    If a week is missing, adds it with Value=0.
+    Assumes df is indexed by Date and sorted.
     """
     if df.empty:
         return df
-
-    # 1️⃣  Make sure we are working on a DatetimeIndex
-    if isinstance(df.index, pd.DatetimeIndex):
-        wk_index = df.index
+    # Determine frequency (try infer, fallback to 'W-MON')
+    freq = pd.infer_freq(df.index)
+    if freq is None:
+        freq = 'W-MON'
+    all_weeks = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
+    df_filled = df.reindex(all_weeks)
+    if 'Value' in df_filled.columns:
+        df_filled['Value'] = df_filled['Value'].fillna(0)
     else:
-        if date_col not in df.columns:
-            raise KeyError(
-                f"{date_col!r} not found in columns and the index "
-                "is not a DatetimeIndex."
-            )
-        df = df.set_index(date_col)
-        wk_index = df.index
-
-    # 2️⃣  Infer weekly frequency (fallback to Monday-ending weeks)
-    freq = pd.infer_freq(wk_index.sort_values()) or "W-MON"
-
-    full_range = pd.date_range(
-        start=wk_index.min(),
-        end=wk_index.max(),
-        freq=freq,
-        name="Date",
-    )
-
-    # 3️⃣  Single-item vs. multi-item handling
-    is_multi = (
-        item_col
-        and item_col in df.columns
-        and df[item_col].nunique() > 1
-    )
-
-    if not is_multi:  # -------- single-item quick path -------------
-        out = df.reindex(full_range)
-        out["Value"] = out["Value"].fillna(0)
-        return out
-
-    # ------------------------- multi-item path ----------------------
-    pieces = []
-    for item, grp in df.groupby(item_col):
-        # grp already has Date as index
-        padded = grp.reindex(full_range)
-        padded["Value"] = padded["Value"].fillna(0)
-        padded[item_col] = item          # keep the label!
-        pieces.append(padded)
-
-    out = pd.concat(pieces)
-    out = out.sort_index()
-    
-    return out
+        df_filled = df_filled.fillna(0)
+    df_filled.index.name = 'Date'
+    return df_filled
 
 def load_weekly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: int = 0, date_col: str = 'Date', value_col: str = 'Value', item_col: Optional[str] = 'Forecast Item', fill_missing_weeks_flag: bool = True, skip_leading_zeros: bool = False) -> pd.DataFrame:
     """
@@ -153,7 +111,7 @@ def load_weekly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: in
         df = df.dropna(subset=['Value'])
         # Optionally fill missing weekly records with 0
         if fill_missing_weeks_flag:
-            df = fill_missing_weeks(df, date_col='Date', item_col=item_col)
+            df = fill_missing_weeks(df)
         print("FILLING COMPLETE")
         # Skip leading zeros if requested
         # We do this after fill_missing_weeks to ensure proper date continuity
@@ -563,10 +521,6 @@ def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_
         return None
 
     # Split data (70% train, 30% test)
-    if item_data.index.freq is None:
-        inferred = pd.infer_freq(item_data.index)
-        if inferred:
-            item_data = item_data.asfreq(inferred)
     train_len = int(len(item_data) * 0.7)
     if train_len < 2: # Need at least 2 points for some models
          logging.warning(f"Skipping item {item_data.name}: Not enough training data ({train_len}) after split")
