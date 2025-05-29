@@ -20,7 +20,6 @@ from statsmodels.tsa.arima.model import ARIMA
 # --- Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning) # To ignore some statsmodels warnings
 pd.set_option('display.max_rows', 50)
 pd.set_option('display.max_columns', 20)
 
@@ -29,14 +28,15 @@ pd.set_option('display.max_columns', 20)
 DEFAULT_ERROR_METRIC = 'smape'  # Options: 'mape', 'smape', 'rmse'
 
 DEFAULT_PARAMS = {
-    "ma_windows": list(range(2, 19)), # Moving average windows: 2 to 18 months
-    "es_alphas": np.round(np.arange(0.01, 1.0, 0.01), 2).tolist(), # Smoothing levels for ES
-    "croston_alphas": np.round(np.arange(0.01, 1.0, 0.01), 2).tolist(), # Smoothing levels for Croston
-    "mlr_seasonalities": list(range(2, 12)), # Seasonal cycles for MLR: quarterly, semi-annually, annually
+    "ma_windows": list(range(2, 27)), # Expanded: 2 to 26 months
+    "es_alphas": np.round(np.arange(0.01, 1.0, 0.01), 1).tolist(), # Kept standard range
+    "croston_alphas": np.round(np.arange(0.01, 1.0, 0.01), 1).tolist(), # Added for clarity, same as ES
+    "mlr_seasonalities": list(range(4, 27)), # Expanded: 4 to 26 months (e.g., 12 for annual)
     "arima_orders": [
-        (p, d, q) for p in range(3) for d in range(2) for q in range(3) # (0-2, 0-1, 0-2)
-    ], # Expanded ARIMA orders
-    "arima_trends": ['n', 'c', 't', 'ct'], # 'none', 'constant', 'trend', 'constant+trend'
+        (p, 0, q) for p in range(3) for q in range(3)
+        ] + [(p, 1, q) for p in range(3) for q in range(3)
+    ],
+    "arima_trends": ['n', 'c', 'ct'],
 }
 
 # --- Helper Functions ---
@@ -49,9 +49,12 @@ def remove_leading_zeros(series: pd.Series) -> pd.Series:
     """
     if series.empty:
         return series
+
     first_nonzero_idx = series[series != 0].index.min() if (series != 0).any() else None
+
     if first_nonzero_idx is None:
         return series
+
     return series.loc[first_nonzero_idx:]
 
 def fill_missing_months(
@@ -62,41 +65,29 @@ def fill_missing_months(
     """
     Pad every Forecast Item with the full monthly range between the
     global min-date and max-date. Missing months are inserted with Value=0.
-    Assumes dates are generally month-start or month-end.
+
+    Works whether the frame already has a DatetimeIndex *or* still has a
+    plain `date_col` column.
     """
     if df.empty:
         return df
 
-    if not isinstance(df.index, pd.DatetimeIndex):
+    if isinstance(df.index, pd.DatetimeIndex):
+        month_index = df.index
+    else:
         if date_col not in df.columns:
             raise KeyError(
                 f"{date_col!r} not found in columns and the index "
                 "is not a DatetimeIndex."
             )
-        df = df.set_index(date_col) # Date column becomes index
+        df = df.set_index(date_col)
+        month_index = df.index
 
-    # Ensure index is DatetimeIndex
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index)
-        
-    date_idx = df.index
-
-    # Infer monthly frequency (fallback to Month Start 'MS')
-    # Normalize to month start for consistent frequency if possible
-    # This helps pd.infer_freq if dates are, e.g., all 1st of month or all end of month
-    try:
-        # Attempt to make dates month-start to help inference, if not already
-        # This is a heuristic. If data is truly mid-month, infer_freq might still struggle.
-        normalized_dates = date_idx.to_period('M').to_timestamp('MS')
-        inferred_freq = pd.infer_freq(normalized_dates.sort_values())
-    except AttributeError: # Handle cases where index might not have to_period (e.g. non-datetime)
-        inferred_freq = None
-        
-    freq = inferred_freq or "MS" # Default to Month Start if inference fails or not clear
+    freq = pd.infer_freq(month_index.sort_values()) or "MS" # Default to Month Start
 
     full_range = pd.date_range(
-        start=date_idx.min(),
-        end=date_idx.max(),
+        start=month_index.min(),
+        end=month_index.max(),
         freq=freq,
         name="Date",
     )
@@ -110,9 +101,6 @@ def fill_missing_months(
     if not is_multi:
         out = df.reindex(full_range)
         out["Value"] = out["Value"].fillna(0)
-        # If original df had item_col, ensure it's preserved
-        if item_col and item_col in df.columns and item_col not in out.columns:
-             out[item_col] = df[item_col].iloc[0] if not df.empty else "Single_Item_Padded"
         return out
 
     pieces = []
@@ -124,13 +112,14 @@ def fill_missing_months(
 
     out = pd.concat(pieces)
     out = out.sort_index()
+
     return out
 
 def load_monthly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: int = 0, date_col: str = 'Date', value_col: str = 'Value', item_col: Optional[str] = 'Forecast Item', fill_missing_months_flag: bool = True, skip_leading_zeros: bool = False) -> pd.DataFrame:
     """
     Loads and prepares monthly data from an Excel file.
     If fill_missing_months_flag is True (default), fills missing monthly dates with zeros.
-    If False, missing months are omitted.
+    If False, missing months are omitted (no zeros inserted).
     """
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name, skiprows=skiprows)
@@ -141,33 +130,19 @@ def load_monthly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: i
              df = df[[item_col, 'Date', 'Value']]
         else:
             df = df[['Date', 'Value']]
-            # Create a default item column if it doesn't exist
-            # df[item_col if item_col else 'Forecast Item'] = 'Single_Item' # Use provided or default name
-            # Let's use a fixed default name if item_col is None for simplicity in grouping later
-            df['Forecast Item_temp'] = 'Single_Item' # Assign a default item name
-            item_col = 'Forecast Item_temp' # Use this temporary name
-
+            df[item_col] = 'Single_Item'
 
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.set_index('Date').sort_index()
         df['Value'] = pd.to_numeric(df['Value'], errors='coerce')
         df = df.dropna(subset=['Value'])
 
-        # Ensure a monthly frequency on the index if possible
-        # This helps standardize before filling missing months
-        try:
-            # Normalize to month start, then try to set freq
-            df.index = df.index.to_period('M').to_timestamp('MS')
-            df = df.asfreq('MS') # This might introduce NaNs if original data wasn't perfectly MS
-        except Exception as e:
-            logging.warning(f"Could not forcefully set monthly frequency on index: {e}. Proceeding with inferred/existing.")
-
-
         if fill_missing_months_flag:
             df = fill_missing_months(df, date_col='Date', item_col=item_col)
-        
+        print("FILLING COMPLETE")
+
         if skip_leading_zeros and not df.empty:
-            if item_col and item_col in df.columns and df[item_col].nunique() > 1:
+            if item_col and item_col in df.columns and len(df[item_col].unique()) > 1:
                 groups = []
                 for name, group in df.groupby(item_col):
                     processed_series = remove_leading_zeros(group['Value'])
@@ -178,12 +153,6 @@ def load_monthly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: i
             else:
                 processed_series = remove_leading_zeros(df['Value'])
                 df = df.loc[processed_series.index]
-        
-        # If we used a temporary item column, rename it to a standard one if the original was None
-        if 'Forecast Item_temp' in df.columns and item_col == 'Forecast Item_temp':
-            df = df.rename(columns={'Forecast Item_temp': 'Forecast Item'})
-
-
         return df
 
     except FileNotFoundError:
@@ -208,36 +177,56 @@ def calculate_error_metric(actual: pd.Series, forecast: pd.Series, metric: Liter
     """Calculates specified error metric ensuring alignment and handling zeros."""
     actual = actual.copy()
     forecast = forecast.copy()
+
     forecast = forecast.reindex(actual.index)
+
     mask = actual.notna() & forecast.notna()
     actual = actual[mask]
     forecast = forecast[mask]
-    
+
     if len(actual) == 0:
+        logging.warning("No valid points for error calculation after alignment.")
         return np.inf
-    
+
     if metric == 'mape':
         mask_zero = actual != 0
         if not mask_zero.all():
+            logging.warning(f"Zeros found in actual values during MAPE calculation. These points ({sum(~mask_zero)}) will be excluded.")
             actual = actual[mask_zero]
             forecast = forecast[mask_zero]
-            if len(actual) == 0: return np.inf
-        return np.abs((actual - forecast) / actual).mean() * 100
+
+            if len(actual) == 0:
+                logging.warning("No valid points for MAPE calculation after zero handling.")
+                return np.inf
+
+        abs_percentage_errors = np.abs((actual - forecast) / actual) * 100
+        return abs_percentage_errors.mean()
+
     elif metric == 'smape':
         numerator = np.abs(forecast - actual)
         denominator = np.abs(forecast) + np.abs(actual)
+
         mask_zero = denominator != 0
         if not mask_zero.all():
+            logging.warning(f"Zero denominators found during SMAPE calculation. These points ({sum(~mask_zero)}) will be excluded.")
             numerator = numerator[mask_zero]
             denominator = denominator[mask_zero]
-            if len(numerator) == 0: return np.inf
-        return (200 * numerator / denominator).mean()
+
+            if len(numerator) == 0:
+                logging.warning("No valid points for SMAPE calculation after zero handling.")
+                return np.inf
+
+        smape_values = 200 * numerator / denominator
+        return smape_values.mean()
+
     elif metric == 'rmse':
         return np.sqrt(mean_squared_error(actual, forecast))
-    else: # Default to SMAPE
+
+    else:
+        logging.warning(f"Unknown error metric: {metric}. Using SMAPE instead.")
         return calculate_error_metric(actual, forecast, 'smape')
 
-# --- Model Implementations (Adjusted for Monthly) ---
+# --- Model Implementations (Simplified) ---
 
 def forecast_moving_average(train_data: pd.Series, test_len: int, window: int) -> Optional[pd.Series]:
     """Generates forecasts using a simple moving average."""
@@ -245,43 +234,26 @@ def forecast_moving_average(train_data: pd.Series, test_len: int, window: int) -
         logging.warning(f"MA: Not enough training data ({len(train_data)}) for window {window}")
         return None
     last_train_avg = train_data.iloc[-window:].mean()
-    # Ensure a monthly frequency for the forecast index
-    current_freq = train_data.index.freq or pd.infer_freq(train_data.index) or 'MS'
-    if isinstance(current_freq, str):
-        current_freq = pd.tseries.frequencies.to_offset(current_freq)
-
-    forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1) # Ensure it starts next month
     
-    # If original data was, e.g. end of month, try to preserve that.
-    # A simple heuristic: if original freq was 'M', use 'M'. Otherwise 'MS'.
-    forecast_freq = 'M' if hasattr(current_freq, 'rule_code') and current_freq.rule_code == 'M' else 'MS'
-        
-    forecast_index = pd.date_range(start=forecast_start_date.normalize() if forecast_freq=='MS' else (forecast_start_date + pd.offsets.MonthEnd(0)), 
-                                   periods=test_len, freq=forecast_freq)
-
-    return pd.Series([last_train_avg] * test_len, index=forecast_index)
-
+    freq = train_data.index.freq or pd.infer_freq(train_data.index) or 'MS'
+    forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1)
+    forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=freq)
+    
+    forecast = pd.Series([last_train_avg] * test_len, index=forecast_index)
+    return forecast
 
 def forecast_exponential_smoothing(train_data: pd.Series, test_len: int, alpha: float) -> Optional[pd.Series]:
     """Generates forecasts using simple exponential smoothing."""
     try:
-        # Ensure train_data has a frequency for SimpleExpSmoothing
-        if train_data.index.freq is None:
-            inferred_freq = pd.infer_freq(train_data.index)
-            if inferred_freq:
-                train_data = train_data.asfreq(inferred_freq)
-            else: # Fallback if still no freq
-                train_data = train_data.asfreq('MS') # Default to Month Start
-                logging.warning("ES: Training data frequency not found, defaulted to 'MS'.")
-
         model = sm.tsa.SimpleExpSmoothing(train_data, initialization_method='heuristic').fit(smoothing_level=alpha, optimized=False)
         forecast_values = model.forecast(steps=test_len)
         
-        current_freq_offset = train_data.index.freq or pd.tseries.frequencies.to_offset('MS')
-        forecast_start_date = train_data.index[-1] + current_freq_offset
+        freq = train_data.index.freq or pd.infer_freq(train_data.index) or 'MS'
+        forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1)
+        forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=freq)
         
-        forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=current_freq_offset)
-        return pd.Series(forecast_values, index=forecast_index)
+        forecast = pd.Series(forecast_values, index=forecast_index)
+        return forecast
     except Exception as e:
         logging.error(f"ES Error (alpha={alpha}): {e}")
         return None
@@ -291,135 +263,163 @@ def forecast_linear_regression(train_data: pd.Series, test_len: int) -> Optional
     try:
         X_train = np.arange(len(train_data)).reshape(-1, 1)
         y_train = train_data.values
-        model = LinearRegression().fit(X_train, y_train)
+
+        model = LinearRegression()
+        model.fit(X_train, y_train)
         
-        logging.info(f"Linear Regression Coefficients: {model.coef_}")
-        logging.info(f"Linear Regression Intercept: {model.intercept_}")
+        # The print statements for coefficients might need context for monthly data.
+        # For instance, model.coef_ is the trend per month.
+        # The original print statements were likely placeholders or specific to a weekly context.
+        # print("Linear Regression Coefficients (per period):")
+        # print(model.coef_)
+        # print("Linear Regression Intercept:")
+        # print(model.intercept_)
 
         X_test = np.arange(len(train_data), len(train_data) + test_len).reshape(-1, 1)
         forecast_values = model.predict(X_test)
+
+        freq = train_data.index.freq or pd.infer_freq(train_data.index) or 'MS'
+        forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1)
+        forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=freq)
         
-        current_freq_offset = train_data.index.freq or pd.tseries.frequencies.to_offset('MS')
-        forecast_start_date = train_data.index[-1] + current_freq_offset
-        forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=current_freq_offset)
-        
-        return pd.Series(forecast_values, index=forecast_index)
+        forecast = pd.Series(forecast_values, index=forecast_index)
+        return forecast
     except Exception as e:
         logging.error(f"LR Error: {e}")
         return None
 
-def forecast_multiple_linear_regression(train_data: pd.Series, test_len: int, seasonality: int) -> Optional[pd.Series]:
+def forecast_multiple_linear_regression(train_data: pd.Series, test_len: int, seasonality: int) -> pd.Series:
     """
     Forecast next `test_len` periods using multiple linear regression
-    with monthly seasonality and linear trend.
-    `seasonality` is the number of months in a cycle (e.g., 12 for yearly).
+    with monthly seasonality and linear trend, ignoring decay and evaluation.
     """
-    # The test_len+2 and slicing preds[2:] seems specific, will keep for direct conversion
-    # Consider reviewing this if it causes issues with monthly data or if its purpose is unknown
-    effective_test_len = test_len + 2 
+    test_len_adj = test_len # Keep original test_len for forecast series index
+    # The original code added 2 to test_len and then sliced. Replicating if necessary,
+    # but for monthly data, direct forecasting is often cleaner.
+    # For now, let's assume test_len is the exact number of future periods needed.
 
-    # Ensure train_data has a DatetimeIndex and monthly frequency
-    if not isinstance(train_data.index, pd.DatetimeIndex):
-        train_data.index = pd.to_datetime(train_data.index)
+    current_freq = train_data.index.freq or pd.infer_freq(train_data.index)
+    if not current_freq:
+        logging.warning("MLR: Could not infer frequency for train_data. Assuming 'MS'.")
+        # Ensure train_data has a frequency before proceeding
+        train_data = train_data.asfreq('MS') # Or handle error
+        current_freq = 'MS'
     
-    original_freq = train_data.index.freq or pd.infer_freq(train_data.index)
-    if not original_freq:
-        train_data = train_data.asfreq('MS') # Default to Month Start
-        logging.warning("MLR: Training data frequency not found or irregular, defaulted to 'MS'.")
-        original_freq = train_data.index.freq
-    elif isinstance(original_freq, str):
-         train_data = train_data.asfreq(original_freq) # Ensure it's set
-         original_freq = train_data.index.freq
+    # Ensure DateTimeIndex with freq
+    if not isinstance(train_data.index, pd.DatetimeIndex) or train_data.index.freq is None:
+         # Attempt to set frequency if not already set, common for monthly data from various sources
+        train_data.index = pd.DatetimeIndex(train_data.index, freq=current_freq)
+        if train_data.index.freq is None: # Still none after attempt
+            raise ValueError("train_data must have a regular DateTimeIndex with a defined freq.")
 
 
-    # Trend feature: days since the start of the series
-    numeric_date_train = (train_data.index - train_data.index.min()).days
-    
-    # Seasonal feature: month number within the specified seasonal cycle
-    # Calculate months from start to create a 0-indexed seasonal period
-    month_sequence_train = (train_data.index.year - train_data.index.min().year) * 12 + \
-                           (train_data.index.month - train_data.index.min().month)
-    seasonal_period_train = month_sequence_train % seasonality
-    
-    X_train_seasonal = pd.get_dummies(seasonal_period_train, prefix=f'month_cycle_s{seasonality}')
-    # Ensure all possible seasonal dummy columns exist
+    # Numeric time trend (e.g., months since start of data)
+    time_trend_train = np.arange(len(train_data))
+
+    # Seasonality feature: month index within the cycle of 'seasonality' months
+    month_in_cycle_train = time_trend_train % seasonality
+
+    X_train_df = pd.DataFrame({
+        'time_trend': time_trend_train
+    })
+
+    # One-hot encode seasonality
+    seasonal_dummies_train = pd.get_dummies(month_in_cycle_train, prefix=f'cycle_month', drop_first=False)
+    # Ensure all possible seasonal columns are present (0 to seasonality-1)
     for i in range(seasonality):
-        col_name = f'month_cycle_s{seasonality}_{i}'
-        if col_name not in X_train_seasonal.columns:
-            X_train_seasonal[col_name] = 0
-    X_train_seasonal = X_train_seasonal.sort_index(axis=1) # Consistent column order
+        col_name = f'cycle_month_{i}'
+        if col_name not in seasonal_dummies_train.columns:
+            seasonal_dummies_train[col_name] = 0
+    seasonal_dummies_train = seasonal_dummies_train[[f'cycle_month_{i}' for i in range(seasonality)]]
 
-    X_train = X_train_seasonal
-    X_train['trend'] = numeric_date_train
+
+    X_train = pd.concat([X_train_df, seasonal_dummies_train], axis=1)
     y_train = train_data.values
-    
-    model = LinearRegression().fit(X_train, y_train)
-    
+
+    model = LinearRegression()
+    model.fit(X_train, y_train)
+
     last_date_train = train_data.index.max()
-    # Use the determined frequency of the training data for future dates
-    future_index = pd.date_range(start=last_date_train + original_freq, periods=effective_test_len, freq=original_freq)
+    # Use the determined/assigned frequency of the training data
+    forecast_index = pd.date_range(start=last_date_train + pd.DateOffset(months=1), periods=test_len_adj, freq=train_data.index.freq)
+
+    time_trend_test = np.arange(len(train_data), len(train_data) + test_len_adj)
+    month_in_cycle_test = time_trend_test % seasonality
     
-    numeric_date_test = (future_index - train_data.index.min()).days
-    month_sequence_test = (future_index.year - train_data.index.min().year) * 12 + \
-                          (future_index.month - train_data.index.min().month)
-    seasonal_period_test = month_sequence_test % seasonality
-                          
-    X_test_seasonal = pd.get_dummies(seasonal_period_test, prefix=f'month_cycle_s{seasonality}')
-    for i in range(seasonality): # Ensure all columns
-        col_name = f'month_cycle_s{seasonality}_{i}'
-        if col_name not in X_test_seasonal.columns:
-            X_test_seasonal[col_name] = 0
-    X_test_seasonal = X_test_seasonal.sort_index(axis=1) # Consistent column order
-    
-    X_test = X_test_seasonal
-    X_test['trend'] = numeric_date_test
+    X_test_df = pd.DataFrame({
+        'time_trend': time_trend_test
+    })
+    seasonal_dummies_test = pd.get_dummies(month_in_cycle_test, prefix=f'cycle_month', drop_first=False)
+    for i in range(seasonality):
+        col_name = f'cycle_month_{i}'
+        if col_name not in seasonal_dummies_test.columns:
+            seasonal_dummies_test[col_name] = 0 # Add missing columns with 0
+    # Ensure consistent column order with training
+    seasonal_dummies_test = seasonal_dummies_test[[f'cycle_month_{i}' for i in range(seasonality)]]
+
+
+    X_test = pd.concat([X_test_df, seasonal_dummies_test], axis=1)
     
     preds = model.predict(X_test)
-    preds = np.maximum(0, preds) # Enforce non-negativity
-    
-    # Apply the original slicing logic
-    return pd.Series(preds[2:], index=future_index[:-2], name='forecast')
+    preds = np.maximum(0, preds)
+
+    return pd.Series(preds, index=forecast_index, name='forecast')
 
 
 def forecast_croston(train_data: pd.Series, test_len: int, alpha: float = 0.1) -> Optional[pd.Series]:
-    """Generates forecasts using Croston's method for intermittent demand (monthly)."""
+    """Generates forecasts using Croston's method for intermittent demand."""
     if len(train_data) < 2:
         logging.warning(f"Croston: Not enough data ({len(train_data)})")
         return None
 
     demand = train_data.values
     n = len(demand)
-    Z, X, fitted = np.zeros(n), np.zeros(n), np.zeros(n)
-    first_idx = next((i for i, v in enumerate(demand) if v != 0), None)
 
+    Z = np.zeros(n)
+    X = np.zeros(n)
+    fitted = np.zeros(n)
+
+    first_idx = next((i for i, v in enumerate(demand) if v != 0), None)
     if first_idx is None:
         logging.warning("Croston: No non-zero demands in training data")
-        # Return a series of zeros for the forecast period
-        current_freq_offset = train_data.index.freq or pd.tseries.frequencies.to_offset('MS')
-        forecast_start_date = train_data.index[-1] + current_freq_offset
-        idx = pd.date_range(start=forecast_start_date, periods=test_len, freq=current_freq_offset)
+        # Return a series of zeros for the forecast period if no demand
+        freq = train_data.index.freq or pd.infer_freq(train_data.index) or 'MS'
+        forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1)
+        idx = pd.date_range(start=forecast_start_date, periods=test_len, freq=freq)
         return pd.Series([0] * test_len, index=idx)
 
 
-    Z[first_idx], X[first_idx], q = demand[first_idx], 1, 1
+    Z[first_idx] = demand[first_idx]
+    X[first_idx] = 1
+    q = 1
+
     for i in range(first_idx + 1, n):
         if demand[i] != 0:
             Z[i] = alpha * demand[i] + (1 - alpha) * Z[i - 1]
             X[i] = alpha * q + (1 - alpha) * X[i - 1]
             q = 1
         else:
-            Z[i], X[i] = Z[i - 1], X[i - 1]
+            Z[i] = Z[i - 1]
+            X[i] = X[i - 1]
             q += 1
-        fitted[i] = Z[i - 1] / X[i - 1] if X[i - 1] > 0 else 0
-    
-    forecast_value = Z[-1] / X[-1] if X[-1] > 0 else 0
-    
-    current_freq_offset = train_data.index.freq or pd.infer_freq(train_data.index) or pd.tseries.frequencies.to_offset('MS')
-    if isinstance(current_freq_offset, str): # Ensure it's an offset
-        current_freq_offset = pd.tseries.frequencies.to_offset(current_freq_offset)
+        if X[i - 1] > 0:
+             fitted[i] = Z[i - 1] / X[i - 1]
+        else:
+             fitted[i] = 0
 
-    forecast_start_date = train_data.index[-1] + current_freq_offset
-    idx = pd.date_range(start=forecast_start_date, periods=test_len, freq=current_freq_offset)
+    if X[-1] > 0:
+        forecast_value = Z[-1] / X[-1]
+    else:
+        forecast_value = 0
+
+    freq = train_data.index.freq or pd.infer_freq(train_data.index)
+    if freq is None:
+        logging.warning("Croston: Cannot determine frequency from training data index. Assuming 'MS'.")
+        freq = 'MS' # Default to Month Start
+
+    forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1)
+    idx = pd.date_range(start=forecast_start_date, periods=test_len, freq=freq)
+
     return pd.Series([forecast_value] * test_len, index=idx)
 
 def forecast_arima(
@@ -428,56 +428,88 @@ def forecast_arima(
     arima_order: Tuple[int, int, int],
     trend_param: str = "n"
 ) -> Optional[pd.Series]:
-    """Generates forecasts using an ARIMA model (monthly)."""
+    """Generates forecasts using an ARIMA model."""
     p, d, q = arima_order
-    # Statsmodels convention: for d > 0, trend 'c' (constant) is often not directly used,
-    # 't' (trend) or 'ct' (constant+trend) might be more appropriate or 'n' (none).
-    # If d > 0, 'c' can be absorbed by differencing, so 'ct' becomes effectively a trend, and 'c' might be redundant.
-    # No explicit change here, relying on statsmodels to handle it or user to choose appropriate trend.
-    # The original warning for d>0 and trend='c' to 'ct' can be kept if it's preferred behaviour.
     if d > 0 and trend_param == 'c':
-         logging.warning(f"ARIMA: For order {arima_order} with d={d}, trend 'c' might be implicitly handled or better as 't' or 'ct'. Using '{trend_param}'.")
-         # Original code changed 'c' to 't'. Let's keep it if that was intended:
-         # trend_param = 't' 
+        logging.warning(f"ARIMA: Changing trend from 'c' to 't' for order {arima_order} with d={d} to allow constant with differencing.")
+        # 't' is trend, 'ct' is constant + trend. For d > 0, 'c' becomes part of 'ct' effectively.
+        # statsmodels uses 't' for trend component when d > 0.
+        # If a constant is desired with differencing, it's usually part of the 'ct' or implicitly handled.
+        # The original 'ct' for d>0 logic was a bit mixed up.
+        # For d > 0, a constant is achieved by `trend='c'` (if model supports it and it means mean of differenced series)
+        # or by the intercept in `trend='t'` or `trend='ct'`.
+        # Let's simplify: if 'c' is passed for d>0, statsmodels usually handles it.
+        # No, statsmodels documentation for ARIMA:
+        # trend : {'n', 'c', 't', 'ct'}
+        # If d > 0 and trend is 'c', it will raise an error. It should be 'n' or 't' or 'ct'.
+        # If user wants a constant with d>0, 'ct' (or 't' if just trend drift) is more appropriate than just 'c'.
+        # Let's change 'c' to 'n' if d>0, assuming they wanted a stationary model post-differencing,
+        # or let it error out / rely on statsmodels default handling.
+        # The original code changed 'c' to 't'.
+        # A common choice if a constant is desired with differencing is that the *differenced* series has a mean.
+        # This is what `trend='c'` implies for d=0.
+        # If d>0, and `trend='c'` is used, it means the d-th differenced series has a non-zero mean.
+        # If d > 0, `trend='c'` implies an intercept. `trend='t'` implies a trend. `trend='ct'` implies both.
+        # The warning about changing 'c' to 'ct' (or 't' as in original code) is reasonable.
+        # Let's stick to the original change to 't' for now.
+        trend_param = 't' # As per original code's intent for d>0 with a constant-like term.
+                          # A more robust solution might be to allow specific 'ct' if user intends it.
 
-
-    min_data_needed = max(p, q) + d + 1 # A rough estimate
+    min_data_needed = sum(arima_order) + d + 1 # A slightly more robust check
     if len(train_data) < min_data_needed:
-        logging.warning(f"ARIMA: Not enough training data ({len(train_data)}) for order={arima_order}, trend={trend_param}. Need at least {min_data_needed}.")
+        logging.warning(
+            f"ARIMA: Not enough training data ({len(train_data)}) for order={arima_order}, trend={trend_param}. Need at least {min_data_needed}"
+        )
         return None
-    if test_len <= 0: return None
+
+    if test_len <= 0:
+        logging.info("ARIMA: test_len is 0, no forecast to generate.")
+        return None
 
     try:
-        # Ensure train_data has a frequency for ARIMA
-        if train_data.index.freq is None:
-            inferred_freq = pd.infer_freq(train_data.index)
-            if inferred_freq:
-                train_data = train_data.asfreq(inferred_freq)
-            else: # Fallback if still no freq
-                train_data = train_data.asfreq('MS') # Default to Month Start for monthly data
-                logging.warning("ARIMA: Training data frequency not found, defaulted to 'MS'.")
-        
-        model = ARIMA(train_data, order=arima_order, trend=trend_param, enforce_stationarity=False, enforce_invertibility=False)
+        # Ensure train_data has a frequency
+        current_freq = train_data.index.freq or pd.infer_freq(train_data.index)
+        if current_freq is None:
+            logging.warning("ARIMA: Frequency not found for train_data. Attempting to set to 'MS'.")
+            # Create a new series with inferred or default frequency
+            # This is crucial for ARIMA
+            train_data_with_freq = train_data.asfreq('MS')
+            if train_data_with_freq.isnull().all(): # check if asfreq failed
+                 logging.error("ARIMA: Failed to set frequency 'MS', data might be unsuitable.")
+                 return None
+            train_data = train_data_with_freq # use the new series
+
+        elif not isinstance(train_data.index, pd.DatetimeIndex) or train_data.index.freq is None:
+             train_data = train_data.asfreq(current_freq) # ensure freq attribute is set
+
+
+        model = ARIMA(train_data, order=arima_order, trend=trend_param)
         model_fit = model.fit()
-        
-        forecast_values = model_fit.forecast(steps=test_len)
-        
-        # Use the frequency from the (potentially modified) training data
-        current_freq_offset = train_data.index.freq
-        forecast_start_date = train_data.index[-1] + current_freq_offset
-        forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=current_freq_offset)
-        
-        return pd.Series(forecast_values, index=forecast_index)
+
+        # Forecast index generation handled by statsmodels `forecast` method if index is regular
+        # However, explicitly creating it ensures alignment with other models if needed
+        raw_fc = model_fit.forecast(steps=test_len)
+
+        # If raw_fc index is not DatetimeIndex (e.g. RangeIndex if original index was not well-defined)
+        # or if we want to ensure consistency:
+        forecast_start_date = train_data.index[-1] + pd.DateOffset(months=1) # Assuming monthly data
+        forecast_index = pd.date_range(start=forecast_start_date, periods=test_len, freq=train_data.index.freq or 'MS')
+
+        forecast = pd.Series(raw_fc, index=forecast_index)
+        return forecast
+
     except Exception as e:
         logging.error(f"ARIMA Error(order={arima_order}, trend={trend_param}): {e}")
+        if 'Prediction must have `end` after `start`' in str(e): #pragma: no cover
+            logging.info(f"ARIMA date range issue with train_data index: {train_data.index[0]} to {train_data.index[-1]}, test_len={test_len}")
         return None
 
 # --- Orchestration ---
 
 def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_forecasts: bool = False, error_metric: str = DEFAULT_ERROR_METRIC) -> Optional[List[Dict[str, Any]]]:
-    """Evaluates multiple models and returns all models sorted by the chosen error metric."""
+    """Evaluates multiple models and returns all models sorted by specified error metric."""
     if item_data.empty or len(item_data) < 4:
-        logging.warning(f"Skipping item {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}: Not enough data ({len(item_data)})")
+        logging.warning(f"Skipping item {item_data.name}: Not enough data ({len(item_data)})")
         return None
 
     if item_data.index.freq is None:
@@ -485,21 +517,25 @@ def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_
         if inferred:
             item_data = item_data.asfreq(inferred)
         else:
+            logging.warning(f"Could not infer frequency for {item_data.name}. Assuming 'MS'.")
             item_data = item_data.asfreq('MS') # Default to Month Start
-            logging.warning(f"Item {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}: Frequency not found, defaulted to 'MS'.")
+            if item_data.isnull().all(): # Check if asfreq made all NaNs
+                logging.error(f"Failed to process {item_data.name} after assuming 'MS' frequency.")
+                return None
 
 
     train_len = int(len(item_data) * 0.7)
     if train_len < 2:
-         logging.warning(f"Skipping item {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}: Not enough training data ({train_len}) after split")
+         logging.warning(f"Skipping item {item_data.name}: Not enough training data ({train_len}) after split")
          return None
     train_data = item_data.iloc[:train_len]
     test_data = item_data.iloc[train_len:]
     test_len = len(test_data)
-    
+
     full_data = item_data.copy()
+
     if test_len == 0:
-        logging.warning(f"Skipping item {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}: No test data after split")
+        logging.warning(f"Skipping item {item_data.name}: No test data after split")
         return None
 
     unique_results = {}
@@ -510,40 +546,77 @@ def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_
         if forecast is not None:
             error_value = calculate_error_metric(test_data, forecast, error_metric)
             model_key = f"Moving Average_window_{w}"
-            result_dict = {"model": "Moving Average", "param_window": w, "error": error_value, "error_metric": error_metric}
-            if return_forecasts: result_dict.update({"train_data": train_data, "test_data": test_data, "forecast": forecast, "full_data": full_data})
+            result_dict = {
+                "model": "Moving Average",
+                "param_window": w,
+                "error": error_value,
+                "error_metric": error_metric
+            }
+            if return_forecasts:
+                result_dict["train_data"] = train_data
+                result_dict["test_data"] = test_data
+                result_dict["forecast"] = forecast
+                result_dict["full_data"] = full_data
             unique_results[model_key] = result_dict
 
-    # 2. Exponential Smoothing
+    # 2. Exponential Smoothing (Simple)
     for alpha in params.get("es_alphas", []):
         forecast = forecast_exponential_smoothing(train_data, test_len, alpha)
         if forecast is not None:
             error_value = calculate_error_metric(test_data, forecast, error_metric)
             model_key = f"Exponential Smoothing_alpha_{alpha}"
-            result_dict = {"model": "Exponential Smoothing", "param_alpha": alpha, "error": error_value, "error_metric": error_metric}
-            if return_forecasts: result_dict.update({"train_data": train_data, "test_data": test_data, "forecast": forecast, "full_data": full_data})
+            result_dict = {
+                "model": "Exponential Smoothing",
+                "param_alpha": alpha,
+                "error": error_value,
+                "error_metric": error_metric
+            }
+            if return_forecasts:
+                result_dict["train_data"] = train_data
+                result_dict["test_data"] = test_data
+                result_dict["forecast"] = forecast
+                result_dict["full_data"] = full_data
             unique_results[model_key] = result_dict
-    
+
     # 3. Linear Regression
     forecast = forecast_linear_regression(train_data, test_len)
     if forecast is not None:
         error_value = calculate_error_metric(test_data, forecast, error_metric)
         model_key = "Linear Regression"
-        result_dict = {"model": "Linear Regression", "param_trend_type": "linear", "error": error_value, "error_metric": error_metric}
-        if return_forecasts: result_dict.update({"train_data": train_data, "test_data": test_data, "forecast": forecast, "full_data": full_data})
+        result_dict = {
+            "model": "Linear Regression",
+            "param": "N/A",
+            "error": error_value,
+            "error_metric": error_metric
+        }
+        if return_forecasts:
+            result_dict["train_data"] = train_data
+            result_dict["test_data"] = test_data
+            result_dict["forecast"] = forecast
+            result_dict["full_data"] = full_data
         unique_results[model_key] = result_dict
 
     # 4. Multiple Linear Regression (with Seasonality)
     for seas in params.get("mlr_seasonalities", []):
-        if len(train_data) < seas + 1 : # Need enough data for seasonality
-            logging.warning(f"MLR: Not enough training data for seasonality {seas}")
+        # Ensure seasonality is not too large for the training data length
+        if seas >= len(train_data) / 2 and seas > 1: # Heuristic: need at least 2 full cycles for reliable seasonality
+            logging.warning(f"MLR: Seasonality {seas} too large for train data length {len(train_data)}. Skipping.")
             continue
         forecast = forecast_multiple_linear_regression(train_data, test_len, seas)
         if forecast is not None:
             error_value = calculate_error_metric(test_data, forecast, error_metric)
             model_key = f"MLR_seasonality_{seas}"
-            result_dict = {"model": "MLR", "param_seasonality_cycle": seas, "error": error_value, "error_metric": error_metric}
-            if return_forecasts: result_dict.update({"train_data": train_data, "test_data": test_data, "forecast": forecast, "full_data": full_data})
+            result_dict = {
+                "model": "MLR",
+                "param_seasonality": seas,
+                "error": error_value,
+                "error_metric": error_metric
+            }
+            if return_forecasts:
+                result_dict["train_data"] = train_data
+                result_dict["test_data"] = test_data
+                result_dict["forecast"] = forecast
+                result_dict["full_data"] = full_data
             unique_results[model_key] = result_dict
 
     # 5. Croston
@@ -552,8 +625,17 @@ def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_
         if forecast is not None:
             error_value = calculate_error_metric(test_data, forecast, error_metric)
             model_key = f"Croston_alpha_{alpha}"
-            result_dict = {"model": "Croston", "param_alpha": alpha, "error": error_value, "error_metric": error_metric}
-            if return_forecasts: result_dict.update({"train_data": train_data, "test_data": test_data, "forecast": forecast, "full_data": full_data})
+            result_dict = {
+                "model": "Croston",
+                "param_alpha": alpha,
+                "error": error_value,
+                "error_metric": error_metric
+            }
+            if return_forecasts:
+                result_dict["train_data"] = train_data
+                result_dict["test_data"] = test_data
+                result_dict["forecast"] = forecast
+                result_dict["full_data"] = full_data
             unique_results[model_key] = result_dict
 
     # 6. ARIMA
@@ -563,68 +645,60 @@ def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_
             if forecast is not None:
                 error_value = calculate_error_metric(test_data, forecast, error_metric)
                 model_key = f"ARIMA_order_{arima_order}_trend_{trend}"
-                result_dict = {"model": "ARIMA", "param_order": str(arima_order), "param_trend": trend, "error": error_value, "error_metric": error_metric}
-                if return_forecasts: result_dict.update({"train_data": train_data, "test_data": test_data, "forecast": forecast, "full_data": full_data})
+                result_dict = {
+                    "model": "ARIMA",
+                    "param_order": str(arima_order),
+                    "param_trend": trend,
+                    "error": error_value,
+                    "error_metric": error_metric
+                }
+                if return_forecasts:
+                    result_dict["train_data"] = train_data
+                    result_dict["test_data"] = test_data
+                    result_dict["forecast"] = forecast
+                    result_dict["full_data"] = full_data
                 unique_results[model_key] = result_dict
 
     results = list(unique_results.values())
+
     if not results:
-        logging.warning(f"No successful models found for item {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}")
+        logging.warning(f"No successful models found for item {item_data.name}")
         return None
 
     results.sort(key=lambda x: x['error'])
-    best_result = results[0]
-    param_info = {k: v for k, v in best_result.items() if k.startswith('param_')}
-    logging.info(f"Best model for {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}: {best_result['model']} with params {param_info} -> {best_result['error_metric'].upper()}: {best_result['error']:.4f}")
-    logging.info(f"Found {len(results)} unique model configurations for {item_data.name if hasattr(item_data, 'name') else 'Unnamed Series'}")
+    best_result = results[0] if results else None
+
+    if best_result:
+        logging.info(f"Best model for {item_data.name}: {best_result['model']} with params { {k: v for k, v in best_result.items() if k.startswith('param_')} } -> {best_result['error_metric'].upper()}: {best_result['error']:.4f}")
+        logging.info(f"Found {len(results)} unique model configurations for {item_data.name}")
 
     return results
 
-
-def run_monthly_forecast(file_path: str, sheet_name: Optional[str] = 0, skiprows: int = 0, date_col: str = 'Date', value_col: str = 'Value', item_col: Optional[str] = 'Forecast Item', output_path: str = "monthly_best_models.xlsx", model_params: Dict = DEFAULT_PARAMS, fill_missing_months_flag: bool = True, skip_leading_zeros: bool = False, return_best_forecasts: bool = False, error_metric: str = DEFAULT_ERROR_METRIC) -> Tuple[pd.DataFrame, Optional[Dict]]:
+def run_simplified_forecast(file_path: str, sheet_name: Optional[str] = 0, skiprows: int = 0, date_col: str = 'Date', value_col: str = 'Value', item_col: Optional[str] = 'Forecast Item', output_path: str = "simplified_best_models_monthly.xlsx", model_params: Dict = DEFAULT_PARAMS, fill_missing_months_flag: bool = True, skip_leading_zeros: bool = False, return_best_forecasts: bool = False, error_metric: str = DEFAULT_ERROR_METRIC) -> Tuple[pd.DataFrame, Optional[Dict]]:
     """
-    Loads monthly data, runs model selection for each item, and saves the best models.
+    Loads data, runs model selection for each item, and saves the best models.
+    If fill_missing_months_flag is True, missing months are filled with zeros. If False, missing months are omitted.
     """
     all_data = load_monthly_data(file_path, sheet_name, skiprows, date_col, value_col, item_col, fill_missing_months_flag=fill_missing_months_flag, skip_leading_zeros=skip_leading_zeros)
-    
-    if all_data.empty:
-        logging.error("No data loaded. Exiting.")
-        return pd.DataFrame(), None
-        
-    logging.info(f"All data shape after loading: {all_data.shape}")
-    
-    best_models_records = []
-    best_forecasts_dict = {}
-    
-    # Determine the actual item column name used (could be original or default 'Forecast Item')
-    # This logic needs to align with how load_monthly_data handles item_col when it's None
-    if item_col and item_col in all_data.columns:
-        grouping_col = item_col
-    elif 'Forecast Item' in all_data.columns: # Default name if load_monthly_data created it
-        grouping_col = 'Forecast Item'
-    else: # Should not happen if load_monthly_data ensures an item column
-        logging.error("Item column for grouping not found in loaded data.")
-        return pd.DataFrame(), None
+    print(f"All data shape: {all_data.shape}")
+    best_models_accumulator = [] # Changed name to avoid conflict with variable in loop
+    best_forecasts_dict = {} # Changed name
 
+    effective_item_col = item_col if item_col and item_col in all_data.columns else 'Single_Item'
+    print(f"Effective item column: {effective_item_col}")
 
-    for item_name, item_data_group in all_data.groupby(grouping_col):
+    for item_name, item_data_group in all_data.groupby(effective_item_col):
         logging.info(f"--- Processing Item: {item_name} ---")
-        # Ensure 'Value' column exists in the group
-        if 'Value' not in item_data_group.columns:
-            logging.error(f"Column 'Value' not found for item {item_name}. Skipping.")
-            continue
-        
-        item_series = item_data_group['Value'].copy()
-        item_series.name = str(item_name) # Set series name for logging inside find_best_model
+        # Pass only the 'Value' series to find_best_model
+        model_results_for_item = find_best_model(item_data_group['Value'], model_params, return_forecasts=return_best_forecasts, error_metric=error_metric)
 
-        model_results_for_item = find_best_model(item_series, model_params, return_forecasts=return_best_forecasts, error_metric=error_metric)
-        
         if model_results_for_item:
             for model_info in model_results_for_item:
-                model_info[grouping_col] = item_name # Use the actual grouping column name
-                best_models_records.append(model_info)
-                
-            if return_best_forecasts and model_results_for_item:
+                model_info_copy = model_info.copy() # Work on a copy
+                model_info_copy['Forecast Item'] = item_name
+                best_models_accumulator.append(model_info_copy)
+
+            if return_best_forecasts and len(model_results_for_item) > 0:
                 best_model_for_item = model_results_for_item[0]
                 if 'forecast' in best_model_for_item:
                     best_forecasts_dict[item_name] = {
@@ -638,31 +712,71 @@ def run_monthly_forecast(file_path: str, sheet_name: Optional[str] = 0, skiprows
                         'params': {k: v for k, v in best_model_for_item.items() if k.startswith('param_')}
                     }
 
-    if not best_models_records:
+    if not best_models_accumulator:
         logging.warning("No best models found for any item.")
-        return pd.DataFrame(), None if return_best_forecasts else None
+        return pd.DataFrame(), None if return_best_forecasts else pd.DataFrame()
 
-    summary_df = pd.DataFrame(best_models_records)
-    
-    # Define preferred column order, ensuring grouping_col is first
-    cols_ordered = [grouping_col, 'model', 'error', 'error_metric']
-    param_cols = sorted([col for col in summary_df.columns if col.startswith('param_')])
-    cols_ordered.extend(param_cols)
-    # Add any other columns that might have been missed (e.g., if return_forecasts was True but not primary interest for summary)
-    other_cols = [col for col in summary_df.columns if col not in cols_ordered]
-    cols_ordered.extend(other_cols)
-    
-    # Filter to existing columns only to avoid KeyError
-    cols_ordered = [col for col in cols_ordered if col in summary_df.columns]
 
-    summary_df = summary_df[cols_ordered]
-    summary_df = summary_df.sort_values(by=[grouping_col, 'error']).reset_index(drop=True)
+    summary_df = pd.DataFrame(best_models_accumulator)
+
+    cols_order = ['Forecast Item', 'model', 'error', 'error_metric']
+    param_cols = sorted([col for col in summary_df.columns if col.startswith('param_') and col not in cols_order])
+    final_cols = cols_order + param_cols
+    # Ensure all expected columns are present, add if missing (e.g., if some models failed for all items)
+    for col in final_cols:
+        if col not in summary_df.columns:
+            summary_df[col] = pd.NA
+
+
+    summary_df = summary_df[final_cols] # Reorder
+    summary_df = summary_df.sort_values(by=['Forecast Item', 'error']).reset_index(drop=True)
+
     summary_df.columns = [col.replace('param_', '') if col.startswith('param_') else col for col in summary_df.columns]
 
     try:
         summary_df.to_excel(output_path, index=False)
-        logging.info(f"Monthly best models summary saved to {output_path}")
+        logging.info(f"Simplified best models summary saved to {output_path}")
     except Exception as e:
         logging.error(f"Error saving results to {output_path}: {e}")
 
-    return summary_df, best_forecasts_dict if return_best_forecasts else None
+    if return_best_forecasts:
+        return summary_df, best_forecasts_dict
+    else:
+        return summary_df, None
+
+# --- Main Execution Example ---
+if __name__ == "__main__":
+    try:
+        # Note: Update file_path, date_col, value_col, item_col as needed for your monthly data.
+        summary_df_results, forecasts_data = run_simplified_forecast(
+            file_path="monthly_data_example.xlsx",  # REQUIRED: Update with your MONTHLY data file
+            # skiprows=0,                             # Optional: Update if needed
+            # date_col='MonthDate',                   # REQUIRED: Update with your date column name for monthly data
+            # value_col='SalesVolume',                # REQUIRED: Update with your value column name
+            # item_col='ProductCategory',             # Optional: Update with your item column name
+            fill_missing_months_flag=True,          # Process monthly data
+            skip_leading_zeros=True,
+            return_best_forecasts=True,             # If you want to inspect forecast objects
+            error_metric='smape'                    # Options: 'mape', 'smape', 'rmse'
+        )
+        if not summary_df_results.empty:
+            print("\n--- Best Model Summary (Monthly) ---")
+            print(summary_df_results.head())
+            print("-" * 30)
+
+            if forecasts_data:
+                print(f"\n--- Forecast data for {len(forecasts_data)} items retrieved ---")
+                # Example: Print forecast for the first item if available
+                # first_item_name = next(iter(forecasts_data))
+                # print(f"\nSample forecast for item: {first_item_name}")
+                # print(forecasts_data[first_item_name]['forecast'].head())
+
+        else:
+            print("No results generated.")
+
+    except FileNotFoundError:
+        print("\nERROR: Input file not found. Please update 'file_path' in the script.")
+    except KeyError as e: #pragma: no cover
+        print(f"\nERROR: Column name mismatch: {e}. Please update 'date_col', 'value_col', or 'item_col'.")
+    except Exception as e: #pragma: no cover
+        print(f"\nAn unexpected error occurred: {e}")
