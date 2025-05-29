@@ -66,68 +66,79 @@ def remove_leading_zeros(series: pd.Series) -> pd.Series:
     # Return series from the first non-zero value onwards
     return series.loc[first_nonzero_idx:]    
 
-def fill_missing_weeks(
-    df: pd.DataFrame,
-    date_col: str = "Date",
-    item_col: Optional[str] = "Forecast Item"
-) -> pd.DataFrame:
+def fill_missing_weeks(df: pd.DataFrame, date_col: str = 'Date', value_col: str = 'Value', item_col: Optional[str] = None) -> pd.DataFrame:
     """
-    Pad every Forecast Item with the full weekly range between the
-    global min-date and max-date.  Missing weeks are inserted with Value=0.
-
-    Works whether the frame already has a DatetimeIndex *or* still has a
-    plain `date_col` column.
+    Ensures there are no missing weekly records for each item between the global first and last date.
+    If a week is missing for an item, adds it with the specified value_col set to 0 for that item.
+    Assumes df is indexed by date_col (e.g., 'Date') and sorted by this index.
+    The date_col parameter refers to the name of the index.
     """
     if df.empty:
         return df
 
-    # 1️⃣  Make sure we are working on a DatetimeIndex
-    if isinstance(df.index, pd.DatetimeIndex):
-        wk_index = df.index
-    else:
-        if date_col not in df.columns:
-            raise KeyError(
-                f"{date_col!r} not found in columns and the index "
-                "is not a DatetimeIndex."
-            )
-        df = df.set_index(date_col)
-        wk_index = df.index
-
-    # 2️⃣  Infer weekly frequency (fallback to Monday-ending weeks)
-    freq = pd.infer_freq(wk_index.sort_values()) or "W-MON"
-
-    full_range = pd.date_range(
-        start=wk_index.min(),
-        end=wk_index.max(),
-        freq=freq,
-        name="Date",
-    )
-
-    # 3️⃣  Single-item vs. multi-item handling
-    is_multi = (
-        item_col
-        and item_col in df.columns
-        and df[item_col].nunique() > 1
-    )
-
-    if not is_multi:  # -------- single-item quick path -------------
-        out = df.reindex(full_range)
-        out["Value"] = out["Value"].fillna(0)
-        return out
-
-    # ------------------------- multi-item path ----------------------
-    pieces = []
-    for item, grp in df.groupby(item_col):
-        # grp already has Date as index
-        padded = grp.reindex(full_range)
-        padded["Value"] = padded["Value"].fillna(0)
-        padded[item_col] = item          # keep the label!
-        pieces.append(padded)
-
-    out = pd.concat(pieces)
-    out = out.sort_index()
+    # Determine overall date range from the input DataFrame's index
+    min_date = df.index.min()
+    max_date = df.index.max()
     
-    return out
+    current_index_name = df.index.name if df.index.name else date_col
+
+    freq = pd.infer_freq(df.index)
+    if freq is None:
+        freq = 'W-MON' # Default weekly frequency, assuming Monday starts
+
+    all_weeks_idx = pd.date_range(start=min_date, end=max_date, freq=freq)
+    all_weeks_idx.name = current_index_name
+
+    if item_col and item_col in df.columns:
+        filled_dfs = []
+        # groupby preserves the order of groups as they first appear
+        for item, group_df in df.groupby(item_col):
+            # group_df comes with date_col as index. Create a copy for modification.
+            group_df_copy = group_df.copy()
+            group_reindexed = group_df_copy.reindex(all_weeks_idx)
+            
+            if value_col in group_reindexed.columns:
+                group_reindexed[value_col] = group_reindexed[value_col].fillna(0)
+            # If value_col was not in original df, it won't be in group_reindexed.
+            # If it's critical, it might need to be created: group_reindexed[value_col] = 0
+
+            group_reindexed[item_col] = item # Fill item_col for new rows
+            
+            # Propagate other column values for the item if they were static
+            for col in group_df_copy.columns:
+                if col not in [value_col, item_col] and col != current_index_name: # current_index_name is date_col
+                    if col in group_reindexed.columns: # Ensure column exists in reindexed frame
+                        unique_vals = group_df_copy[col].dropna().unique()
+                        if len(unique_vals) == 1:
+                            group_reindexed[col] = group_reindexed[col].fillna(unique_vals[0])
+                        # NaNs in other columns (non-static or all NaN in original group) will persist for new rows.
+            filled_dfs.append(group_reindexed)
+        
+        if filled_dfs:
+            df_final_filled = pd.concat(filled_dfs)
+        else: 
+            # This case implies input df was empty or item_col resulted in no groups.
+            # Create a shell df with the full date range.
+            df_final_filled = pd.DataFrame(index=all_weeks_idx)
+            if value_col: # Add value_col if specified
+                 df_final_filled[value_col] = 0
+            # item_col cannot be filled meaningfully here.
+            
+    else:
+        # Original behavior: process as a single series
+        df_final_filled = df.reindex(all_weeks_idx)
+        if value_col in df_final_filled.columns:
+            df_final_filled[value_col] = df_final_filled[value_col].fillna(0)
+        else:
+            # If value_col not present, create it and fill with 0.
+            df_final_filled[value_col] = 0 # Create and fill if not existing
+    
+    # Ensure DataFrame is sorted by index (date)
+    # If concat was used, it stacks groups; sort_index will interleave by date correctly.
+    df_final_filled = df_final_filled.sort_index()
+    df_final_filled.index.name = current_index_name # Ensure index name is set
+    
+    return df_final_filled
 
 def load_weekly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: int = 0, date_col: str = 'Date', value_col: str = 'Value', item_col: Optional[str] = 'Forecast Item', fill_missing_weeks_flag: bool = True, skip_leading_zeros: bool = False) -> pd.DataFrame:
     """
@@ -153,7 +164,7 @@ def load_weekly_data(file_path: str, sheet_name: Optional[str] = 0, skiprows: in
         df = df.dropna(subset=['Value'])
         # Optionally fill missing weekly records with 0
         if fill_missing_weeks_flag:
-            df = fill_missing_weeks(df, date_col='Date', item_col=item_col)
+            df = fill_missing_weeks(df, item_col=item_col)
         print("FILLING COMPLETE")
         # Skip leading zeros if requested
         # We do this after fill_missing_weeks to ensure proper date continuity
@@ -563,10 +574,6 @@ def find_best_model(item_data: pd.Series, params: Dict = DEFAULT_PARAMS, return_
         return None
 
     # Split data (70% train, 30% test)
-    if item_data.index.freq is None:
-        inferred = pd.infer_freq(item_data.index)
-        if inferred:
-            item_data = item_data.asfreq(inferred)
     train_len = int(len(item_data) * 0.7)
     if train_len < 2: # Need at least 2 points for some models
          logging.warning(f"Skipping item {item_data.name}: Not enough training data ({train_len}) after split")
